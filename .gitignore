@@ -167,9 +167,16 @@ dmypy.json
 
 # Project specific
 config.yaml
-logs/
+# Log files
+# logs/
+# *.log
+# reasoning.log
+# execution.log
 extracted_data/
 form_handler/
 temp_deploy/
 *.backup
 service-account-key.json
+
+# Virtual Environment
+venv/
