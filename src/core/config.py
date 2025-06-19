@@ -28,8 +28,8 @@ class GoogleCloudConfig:
     region: str
     zone: str
     credentials_file: str
-    vm: Dict[str, Any]
-    storage: Dict[str, Any]
+    cloud_run: Dict[str, Any]
+    gcs: Dict[str, Any]
     dns: Dict[str, Any]
 
 
@@ -60,7 +60,6 @@ class ProcessingConfig:
 
 @dataclass
 class DeploymentConfig:
-    web_server: str
     ssl_certificate: str
     auto_backup: bool
     monitoring: bool

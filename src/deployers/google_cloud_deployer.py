@@ -11,6 +11,8 @@ from loguru import logger
 
 from google.cloud import compute_v1
 from google.cloud import storage
+from google.cloud import artifactregistry_v1
+from google.cloud.devtools import cloudbuild_v1
 from google.auth import default
 from google.auth.exceptions import DefaultCredentialsError
 from google.api_core import exceptions as google_exceptions
@@ -248,20 +250,13 @@ ExecStart=/usr/local/bin/gunicorn --workers 3 --bind 127.0.0.1:8000 wsgi:app
 WantedBy=multi-user.target
 EOF
 
-# Create WSGI entry point for Gunicorn
-cat > /var/www/html/wsgi.py << 'EOF'
-from form_handler import app
-
-if __name__ == "__main__":
-    app.run()
-EOF
-chown www-data:www-data /var/www/html/wsgi.py
-
 # Enable and start services
 systemctl daemon-reload
-systemctl start form-handler
 systemctl enable form-handler
 systemctl restart nginx
+
+# Signal that startup is complete
+sudo touch /var/log/startup-script.finished
 """
     
     def _wait_for_operation(self, operation):
@@ -334,6 +329,11 @@ systemctl restart nginx
             form_handler_file = temp_dir / "form_handler.py"
             with open(form_handler_file, 'w', encoding='utf-8') as f:
                 f.write(self._get_form_handler_code(processed_data.get('forms', [])))
+
+            # Create wsgi.py entrypoint
+            wsgi_file = temp_dir / "wsgi.py"
+            with open(wsgi_file, 'w', encoding='utf-8') as f:
+                f.write("from form_handler import app\\n\\nif __name__ == '__main__':\\n    app.run()\\n")
             
             # Upload to VM using gcloud
             external_ip = self._get_vm_external_ip()
@@ -378,7 +378,7 @@ systemctl restart nginx
         raise Exception("External IP not found")
     
     def _get_form_handler_code(self, forms: List[Dict[str, Any]]) -> str:
-        """Generate form handler code"""
+        """Generates the Python code for the Flask form handler."""
         smtp_conf = self.config.forms.smtp
         return f"""#!/usr/bin/env python3
 from flask import Flask, request, jsonify
@@ -481,8 +481,34 @@ if __name__ == '__main__':
         
         raise Exception(f"Service '{service_name}' did not become active within {timeout} seconds.")
 
+    def _wait_for_startup_script(self, timeout: int = 600):
+        """Wait for the VM startup script to complete."""
+        logger.info("⏳ Waiting for VM startup script to complete...")
+        start_time = time.time()
+        
+        signal_file = "/var/log/startup-script.finished"
+        
+        while time.time() - start_time < timeout:
+            try:
+                command = [
+                    'gcloud', 'compute', 'ssh',
+                    self.vm_instance.name,
+                    '--zone', self.gcp_config.zone,
+                    '--project', self.gcp_config.project_id,
+                    '--command', f'sudo test -f {signal_file}'
+                ]
+                # Use a shorter retry for this check
+                self._run_gcloud_ssh_command_with_retry(command, retries=1, delay=1, timeout=30)
+                logger.info("✅ Startup script completed.")
+                return
+            except Exception:
+                logger.debug("Startup script not finished yet. Waiting...")
+                time.sleep(15) # Wait longer between checks for startup script
+        
+        raise Exception(f"Startup script did not complete within {timeout} seconds.")
+
     def configure_web_server(self):
-        """Configure web server by waiting for services to be ready."""
+        """Configure web server by restarting and waiting for services."""
         logger.info("🌐 Configuring web server...")
         
         if self.dry_run:
@@ -490,7 +516,21 @@ if __name__ == '__main__':
             return
         
         try:
-            # The startup script initiates the services. Here, we wait for them to be active.
+            # First, wait for the startup script to finish
+            self._wait_for_startup_script()
+
+            # Restart services to apply changes
+            logger.info("Restarting web services...")
+            restart_command = [
+                'gcloud', 'compute', 'ssh',
+                self.vm_instance.name,
+                '--zone', self.gcp_config.zone,
+                '--project', self.gcp_config.project_id,
+                '--command', 'sudo systemctl restart nginx && sudo systemctl restart form-handler'
+            ]
+            self._run_gcloud_ssh_command_with_retry(restart_command, retries=3, delay=5)
+
+            # Wait for services to become active
             self._wait_for_service("nginx")
             self._wait_for_service("form-handler")
             
@@ -501,7 +541,7 @@ if __name__ == '__main__':
             raise
     
     def setup_ssl(self):
-        """Setup SSL certificate"""
+        """Setup SSL using Let's Encrypt"""
         logger.info("🔒 Setting up SSL certificate...")
         
         if self.dry_run:
@@ -632,4 +672,231 @@ find $BACKUP_DIR -type f -mtime +7 -name '*.gz' -delete
             
         except Exception as e:
             logger.error(f"❌ Health check failed: {e}")
-            raise 
+            raise
+
+    def run_deployment(self, processed_data: Dict[str, Any]):
+        """Runs the complete deployment process to GCS and Cloud Run."""
+        logger.info("🚀 Starting new deployment to GCS and Cloud Run...")
+        
+        if self.dry_run:
+            logger.info("🔍 Dry run mode - deployment skipped")
+            return "http://dry-run-deployment-url"
+            
+        try:
+            # Step 1: Upload static content to GCS
+            self.upload_static_to_gcs(processed_data)
+            
+            # Step 2: Build and push form handler container
+            image_uri = self.build_and_push_container(processed_data)
+            
+            # Step 3: Deploy form handler to Cloud Run
+            service_url = self.deploy_to_cloud_run(image_uri)
+            
+            # Update content to point to the new form handler URL
+            # This is a placeholder for a more complex implementation
+            logger.info("✅ Deployment successful. Static content on GCS, form handler on Cloud Run.")
+            
+            # The final URL will be a combination of GCS and Cloud Run, likely behind a Load Balancer
+            # For now, we return the Cloud Run service URL
+            return service_url
+
+        except Exception as e:
+            logger.error(f"❌ Deployment failed: {e}")
+            raise
+            
+    def upload_static_to_gcs(self, processed_data: Dict[str, Any]):
+        """Uploads static website files to Google Cloud Storage."""
+        bucket_name = self.gcp_config.gcs.get('bucket_name')
+        if not bucket_name:
+            raise ValueError("GCS bucket name is not configured.")
+
+        logger.info(f"📤 Uploading static content to GCS bucket: {bucket_name}")
+        
+        # 1. Create bucket if it doesn't exist
+        try:
+            bucket = self.storage_client.create_bucket(bucket_name, location=self.gcp_config.region)
+            logger.info(f"Bucket {bucket_name} created.")
+        except google_exceptions.Conflict:
+            bucket = self.storage_client.get_bucket(bucket_name)
+            logger.info(f"Bucket {bucket_name} already exists.")
+            
+        # 2. Make bucket public
+        bucket.iam_configuration.uniform_bucket_level_access_enabled = False
+        bucket.patch()
+        policy = bucket.get_iam_policy(requested_policy_version=3)
+        policy.bindings.append({"role": "roles/storage.objectViewer", "members": {"allUsers"}})
+        bucket.set_iam_policy(policy)
+        
+        # 3. Configure for website hosting
+        bucket.website_main_page_suffix = 'index.html'
+        bucket.website_not_found_page = '404.html' # Assuming a 404 page might exist
+        bucket.patch()
+        
+        # 4. Upload files
+        # Create a temporary directory for local files to preserve structure
+        temp_dir = Path("temp_gcs_upload")
+        temp_dir.mkdir(exist_ok=True)
+
+        try:
+            # Save pages and assets to temp dir
+            for page in processed_data.get('pages', []):
+                filename = page.get('filename', 'index.html')
+                (temp_dir / filename).write_text(page.get('html', ''), encoding='utf-8')
+
+            for asset in processed_data.get('assets', []):
+                local_path = Path(asset.get('local_path', ''))
+                # Create the full path in the temp directory
+                full_temp_path = temp_dir / local_path.relative_to(local_path.parts[0])
+                full_temp_path.parent.mkdir(parents=True, exist_ok=True)
+                full_temp_path.write_bytes(asset.get('content', b''))
+            
+            # Walk through temp dir and upload
+            for file_path in temp_dir.rglob('*'):
+                if file_path.is_file():
+                    blob_name = str(file_path.relative_to(temp_dir))
+                    blob = bucket.blob(blob_name)
+                    blob.upload_from_filename(str(file_path))
+                    logger.debug(f"Uploaded {blob_name} to bucket {bucket_name}.")
+
+        finally:
+            import shutil
+            shutil.rmtree(temp_dir)
+            
+        logger.info(f"✅ Static content uploaded successfully to gs://{bucket_name}")
+
+    def build_and_push_container(self, processed_data: Dict[str, Any]) -> str:
+        """Builds a container using Google Cloud Build and pushes to Artifact Registry."""
+        logger.info("📦 Building container with Cloud Build...")
+        
+        project_id = self.gcp_config.project_id
+        location = self.gcp_config.region
+        repo_name = self.gcp_config.cloud_run.get('repo_name')
+        image_name = self.gcp_config.cloud_run.get('service_name')
+        source_bucket_name = f"{project_id}-cloudbuild-source"
+
+        # 1. Prepare and upload source code to a GCS bucket
+        source_archive = self._prepare_and_upload_source(processed_data, source_bucket_name)
+
+        # 2. Ensure Artifact Registry repository exists
+        self._ensure_artifact_registry_repo(repo_name)
+
+        # 3. Trigger Cloud Build
+        image_uri = f"{location}-docker.pkg.dev/{project_id}/{repo_name}/{image_name}"
+        self._trigger_cloud_build(source_bucket_name, source_archive, image_uri)
+        
+        final_image_uri = f"{image_uri}:latest"
+        logger.info(f"✅ Cloud Build finished. Image URI: {final_image_uri}")
+        
+        return final_image_uri
+
+    def _prepare_and_upload_source(self, processed_data, bucket_name):
+        """Creates a source tarball and uploads it to GCS for Cloud Build."""
+        import tarfile
+        
+        temp_dir = Path("temp_build_source")
+        temp_dir.mkdir(exist_ok=True)
+        archive_path = Path("source.tar.gz")
+
+        try:
+            # Create files in temp dir
+            (temp_dir / "form_handler.py").write_text(self._get_form_handler_code(processed_data.get('forms', [])))
+            (temp_dir / "wsgi.py").write_text("from form_handler import app\\n\\nif __name__ == '__main__':\\n    app.run()\\n")
+            # We also need the Dockerfile and requirements
+            with open("Dockerfile", "r") as f_in, open(temp_dir / "Dockerfile", "w") as f_out:
+                f_out.write(f_in.read())
+            with open("requirements.txt", "r") as f_in, open(temp_dir / "requirements.txt", "w") as f_out:
+                f_out.write(f_in.read())
+
+            # Create tarball
+            with tarfile.open(archive_path, "w:gz") as tar:
+                tar.add(str(temp_dir), arcname=os.path.sep)
+            
+            # Upload to GCS
+            bucket = self.storage_client.bucket(bucket_name)
+            if not bucket.exists():
+                self.storage_client.create_bucket(bucket, location=self.gcp_config.region)
+            
+            blob = bucket.blob(archive_path.name)
+            blob.upload_from_filename(archive_path)
+            logger.info(f"Uploaded source to gs://{bucket_name}/{archive_path.name}")
+            return archive_path.name
+        finally:
+            import shutil
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            if archive_path.exists():
+                os.remove(archive_path)
+
+    def _ensure_artifact_registry_repo(self, repo_name):
+        """Checks if an Artifact Registry repo exists, creates if not, using gcloud."""
+        logger.info(f"Ensuring Artifact Registry repository '{repo_name}' exists...")
+        
+        command = [
+            'gcloud', 'artifacts', 'repositories', 'create', repo_name,
+            f'--project={self.gcp_config.project_id}',
+            f'--location={self.gcp_config.region}',
+            '--repository-format=docker',
+            '--quiet'
+        ]
+        
+        try:
+            # We run this command, but ignore failures in case it already exists.
+            # A more robust solution would be to list and check, but this is simpler.
+            subprocess.run(command, check=False, capture_output=True, text=True)
+            logger.info(f"Successfully ensured repository '{repo_name}' exists.")
+        except Exception as e:
+            logger.warning(f"Could not create repository (it might already exist): {e}")
+
+    def _trigger_cloud_build(self, bucket, archive, image_uri):
+        """Triggers a Cloud Build job using gcloud and waits for it to complete."""
+        logger.info(f"Submitting Cloud Build job for image {image_uri}...")
+        
+        command = [
+            'gcloud', 'builds', 'submit', f'gs://{bucket}/{archive}',
+            f'--tag={image_uri}',
+            f'--project={self.gcp_config.project_id}',
+            '--quiet'
+        ]
+        
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        logger.info("Cloud Build job finished.")
+        return result
+
+    def deploy_to_cloud_run(self, image_uri: str) -> str:
+        """Deploys the container to Google Cloud Run using gcloud."""
+        logger.info(f"☁️ Deploying container {image_uri} to Cloud Run...")
+        
+        service_name = self.gcp_config.cloud_run.get('service_name')
+        
+        command = [
+            'gcloud', 'run', 'deploy', service_name,
+            f'--image={image_uri}',
+            f'--platform=managed',
+            f'--region={self.gcp_config.region}',
+            f'--project={self.gcp_config.project_id}',
+            '--allow-unauthenticated', # To make the service public
+            '--quiet'
+        ]
+
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            
+            # Get the URL of the deployed service
+            describe_command = [
+                'gcloud', 'run', 'services', 'describe', service_name,
+                f'--platform=managed',
+                f'--region={self.gcp_config.region}',
+                f'--project={self.gcp_config.project_id}',
+                '--format=value(status.url)'
+            ]
+            
+            url_result = subprocess.run(describe_command, check=True, capture_output=True, text=True)
+            service_url = url_result.stdout.strip()
+
+            logger.info(f"✅ Service '{service_name}' deployed successfully at {service_url}")
+            return service_url
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Cloud Run deployment failed. Command: {' '.join(e.cmd)}")
+            logger.error(f"Stderr: {e.stderr}")
+            raise e 

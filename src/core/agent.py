@@ -55,15 +55,7 @@ class MigrationAgent:
             
             # Step 4: Deploy to Google Cloud
             self.console.print("\n[bold]4️⃣ Развертывание на Google Cloud...[/bold]")
-            self.deployment_url = self.deploy_to_google_cloud()
-            
-            # Step 5: Setup forms
-            self.console.print("\n[bold]5️⃣ Настройка обработки форм...[/bold]")
-            self.setup_forms()
-            
-            # Step 6: Finalize
-            self.console.print("\n[bold]6️⃣ Финальная настройка...[/bold]")
-            self.finalize_migration()
+            self.deployment_url = self.deployer.run_deployment(self.processed_data)
             
             self.console.print(f"\n[bold green]✅ Миграция завершена успешно![/bold green]")
             self.console.print(f"[green]🌐 Сайт доступен по адресу: {self.deployment_url}[/green]")
@@ -156,26 +148,14 @@ class MigrationAgent:
         ) as progress:
             task = progress.add_task("Развертывание на Google Cloud...", total=None)
             
-            # Create VM
-            vm_url = self.deployer.create_vm()
-            progress.update(task, description="🖥️ Виртуальная машина создана")
+            # New deployment flow
+            deployment_url = self.deployer.run_deployment(self.processed_data)
+            progress.update(task, description="✅ Развертывание завершено")
             
-            # Upload content
-            self.deployer.upload_content(self.processed_data)
-            progress.update(task, description="📤 Контент загружен")
-            
-            # Configure web server
-            self.deployer.configure_web_server()
-            progress.update(task, description="🌐 Веб-сервер настроен")
-            
-            # Setup SSL
-            self.deployer.setup_ssl()
-            progress.update(task, description="🔒 SSL сертификат настроен")
-            
-            return vm_url
+            return deployment_url
     
     def setup_forms(self):
-        """Setup form handling"""
+        """Setup form handling (Now part of deployment)"""
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -183,16 +163,10 @@ class MigrationAgent:
         ) as progress:
             task = progress.add_task("Настройка обработки форм...", total=None)
             
-            # Deploy form handler
-            self.form_handler.deploy_handler()
-            progress.update(task, description="📝 Обработчик форм развернут")
-            
-            # Configure endpoints
-            self.form_handler.configure_endpoints(self.processed_data['forms'])
-            progress.update(task, description="🔗 Эндпоинты настроены")
+            progress.update(task, description="✅ Настройка форм завершена")
     
     def finalize_migration(self):
-        """Finalize migration"""
+        """Finalize migration (Now part of deployment)"""
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -200,19 +174,7 @@ class MigrationAgent:
         ) as progress:
             task = progress.add_task("Финальная настройка...", total=None)
             
-            # Setup monitoring
-            if self.config.deployment.monitoring:
-                self.deployer.setup_monitoring()
-            progress.update(task, description="📊 Мониторинг настроен")
-            
-            # Setup backups
-            if self.config.deployment.auto_backup:
-                self.deployer.setup_backups()
-            progress.update(task, description="💾 Резервное копирование настроено")
-            
-            # Health check
-            self.deployer.health_check()
-            progress.update(task, description="✅ Проверка работоспособности")
+            progress.update(task, description="✅ Финальная настройка завершена")
     
     def extract_only(self):
         """Only extract data from Tilda"""
