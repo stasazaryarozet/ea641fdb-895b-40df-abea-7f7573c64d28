@@ -180,3 +180,4 @@ service-account-key.json
 
 # Virtual Environment
 venv/
+dist/
