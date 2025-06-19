@@ -181,3 +181,4 @@ service-account-key.json
 # Virtual Environment
 venv/
 dist/
+node_modules/
