@@ -9,62 +9,89 @@ from loguru import logger
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from .config import Config
-from extractors.tilda_extractor import TildaExtractor
-from processors.content_processor import ContentProcessor
-from deployers.google_cloud_deployer import GoogleCloudDeployer
-from form_handlers.form_handler import FormHandler
-from utils.logger import setup_logging
+from .config import load_config
+from ..extractors.tilda_extractor import TildaExtractor
+from ..processors.content_processor import ContentProcessor
+from ..deployers.google_cloud_deployer import GoogleCloudDeployer
+# from ..form_handlers.form_handler import FormHandler # Пока не используется
+# from ..utils.logger import setup_logging # Пока не используется
 
 
 class MigrationAgent:
-    """Main agent for Tilda to Google Cloud migration"""
+    """
+    Оркестрирует процесс миграции сайта с Tilda на Google Cloud.
+    """
     
-    def __init__(self, config: Config, dry_run: bool = False):
-        self.config = config
+    def __init__(self, config_path: str, dry_run: bool = False):
+        self.config = load_config(config_path)
         self.dry_run = dry_run
         self.console = Console()
         
-        # Initialize components
-        self.extractor = TildaExtractor(config.tilda)
-        self.processor = ContentProcessor(config.processing)
-        self.deployer = GoogleCloudDeployer(config, dry_run)
-        self.form_handler = FormHandler(config.forms)
+        # Инъекция зависимостей для лучшей тестируемости
+        self.extractor = TildaExtractor(self.config.tilda)
+        self.processor = ContentProcessor(self.config.processing)
+        self.deployer = GoogleCloudDeployer(self.config.google_cloud)
+        # self.form_handler = FormHandler(self.config.forms) # Пока не используется
         
         # Migration state
         self.extracted_data = None
         self.processed_data = None
         self.deployment_url = None
         
-    def run(self):
-        """Run complete migration process"""
-        self.console.print("[bold blue]🚀 Запуск миграции Tilda → Google Cloud[/bold blue]")
+        logger.info(f"Migration Agent initialized. Dry run: {self.dry_run}")
         
+    def run(self):
+        """
+        Запускает полный цикл миграции: извлечение, обработка, развертывание.
+        """
         try:
-            # Step 1: Validate configuration
-            self.console.print("\n[bold]1️⃣ Проверка конфигурации...[/bold]")
-            self.validate_configuration()
+            logger.info("Starting migration process...")
             
-            # Step 2: Extract from Tilda
-            self.console.print("\n[bold]2️⃣ Извлечение данных с Tilda...[/bold]")
-            self.extracted_data = self.extract_from_tilda()
+            # Шаг 1: Извлечение
+            pages_list = self._extract()
+            if not pages_list:
+                logger.warning("No pages found to process. Stopping migration.")
+                return
+
+            # Шаг 2: Обработка (пока в упрощенном виде)
+            # В будущем здесь будет цикл по всем страницам
+            page_to_process = self.extractor.get_page_full_export(pages_list[0]['id'])
+            processed_html = self._process(page_to_process)
             
-            # Step 3: Process content
-            self.console.print("\n[bold]3️⃣ Обработка контента...[/bold]")
-            self.processed_data = self.process_content()
-            
-            # Step 4: Deploy to Google Cloud
-            self.console.print("\n[bold]4️⃣ Развертывание на Google Cloud...[/bold]")
-            self.deployment_url = self.deployer.run_deployment(self.processed_data)
-            
-            self.console.print(f"\n[bold green]✅ Миграция завершена успешно![/bold green]")
-            self.console.print(f"[green]🌐 Сайт доступен по адресу: {self.deployment_url}[/green]")
-            
+            # Шаг 3: Развертывание
+            self._deploy(processed_html)
+
+            logger.success("Migration process completed successfully!")
+
         except Exception as e:
-            logger.error(f"Migration failed: {e}")
-            self.console.print(f"\n[bold red]❌ Миграция завершилась с ошибкой: {e}[/bold red]")
+            logger.error(f"Migration failed: {e}", exc_info=True)
             raise
-    
+
+    def _extract(self) -> list:
+        """Извлекает список страниц с Tilda."""
+        logger.info("Step 1: Extracting data from Tilda...")
+        pages = self.extractor.get_pages_list()
+        logger.info(f"Found {len(pages)} pages.")
+        return pages
+
+    def _process(self, page_data: dict) -> str:
+        """Обрабатывает HTML-контент страницы."""
+        logger.info(f"Step 2: Processing content for page ID: {page_data['id']}...")
+        html = self.processor.relativize_links(page_data['html'], self.config.tilda.base_url)
+        html = self.processor.remove_tilda_elements(html)
+        logger.info("Content processed.")
+        return html
+        
+    def _deploy(self, processed_content: str):
+        """Развертывает обработанный контент."""
+        logger.info("Step 3: Deploying to Google Cloud...")
+        if not self.dry_run:
+            self.deployer.create_vm_instance()
+            # Здесь будет логика загрузки контента на созданную VM
+            logger.info("VM creation initiated. Content deployment logic is pending.")
+        else:
+            logger.info("[DRY RUN] Skipping actual deployment.")
+
     def validate_configuration(self):
         """Validate configuration and connections"""
         with Progress(

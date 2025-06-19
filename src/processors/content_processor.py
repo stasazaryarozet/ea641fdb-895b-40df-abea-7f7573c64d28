@@ -15,14 +15,15 @@ import cssutils
 import cssutils.css
 import os
 import requests
+from dotmap import DotMap
 
-from src.core.config import ProcessingConfig
+# from src.core.config import ProcessingConfig # This class was removed
 
 
 class ContentProcessor:
     """Process and optimize extracted content"""
     
-    def __init__(self, config: ProcessingConfig, form_handler_url: Optional[str] = None):
+    def __init__(self, config: DotMap, form_handler_url: str = None):
         self.config = config
         self.form_handler_url = form_handler_url
         self.asset_mapping = {}  # Map original URLs to new local paths
@@ -68,8 +69,13 @@ class ContentProcessor:
         if path == '/' or not path:
             filename = "index.html"
         else:
-            filename = f"{Path(path).name}.html"
+            # Handle cases like /page/ and /page
+            clean_path = path.strip('/')
+            filename = f"{Path(clean_path).name}.html"
+            if not Path(clean_path).name: # root index case again
+                 filename = "index.html"
 
+        
         return {
             **page,
             'html': str(soup), # Use str(soup) instead of prettify() to minimize changes
@@ -115,7 +121,7 @@ class ContentProcessor:
                 }
                 
                 link['href'] = local_path_html
-      
+    
     def _process_js_in_page(self, soup: BeautifulSoup):
         """Finds all JS links, downloads them, and updates the src."""
         for script in soup.find_all('script', src=True):
@@ -173,14 +179,14 @@ class ContentProcessor:
                 css_text = content.decode('utf-8')
                 modified_css = self._parse_and_replace_css_urls(css_text, asset.get('url', ''))
                 content = modified_css.encode('utf-8')
-
-            if asset_type == 'image' and self.config.optimize_images:
+            
+            if asset_type == 'image' and self.config.get("optimize_images"):
                 content = self._optimize_image(content)
             
-            elif asset_type == 'css' and self.config.minify_css:
+            elif asset_type == 'css' and self.config.get("minify_css"):
                 content = self._minify_css(content)
             
-            elif asset_type == 'js' and self.config.minify_js:
+            elif asset_type == 'js' and self.config.get("minify_js"):
                 content = self._minify_js(content)
             
             # Generate local path
@@ -242,202 +248,238 @@ class ContentProcessor:
             logger.warning(f"Failed during CSS parsing, returning original content. Error: {e}")
             return css_text
 
+    def extract_new_urls_from_css(self, css_text: str, base_url: str) -> List[str]:
+        """
+        Extracts all url() values from a CSS string and returns them as a list
+        of absolute URLs. This is used for the recursive asset download loop.
+        """
+        new_urls = []
+        try:
+            sheet = cssutils.parseString(css_text, validate=False)
+            for url_in_css in cssutils.getUrls(sheet):
+                url = url_in_css.strip("'\" ")
+                if not url or url.startswith('data:'):
+                    continue
+                
+                absolute_url = urljoin(base_url, url)
+                if absolute_url != base_url:
+                    new_urls.append(absolute_url)
+        except Exception as e:
+            logger.warning(f"Could not parse CSS to extract new URLs from base {base_url}. Error: {e}")
+
+        return new_urls
+
     def _optimize_image(self, image_data: bytes) -> bytes:
-        """Optimize image"""
-        try:
-            # Open image
-            image = Image.open(io.BytesIO(image_data))
-            
-            # Convert to RGB if necessary
-            if image.mode in ('RGBA', 'LA', 'P'):
-                # Create white background
-                background = Image.new('RGB', image.size, (255, 255, 255))
-                if image.mode == 'P':
-                    image = image.convert('RGBA')
-                background.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
-                image = background
-            
-            # Optimize
-            output = io.BytesIO()
-            image.save(output, format='JPEG', quality=85, optimize=True)
-            return output.getvalue()
-            
-        except Exception as e:
-            logger.warning(f"Failed to optimize image: {e}")
+        """
+        Optimizes an image by converting it to a web-friendly format
+        and reducing its quality.
+        """
+        if not self.config.get("optimize_images", False):
             return image_data
-    
+            
+        try:
+            with Image.open(io.BytesIO(image_data)) as img:
+                output = io.BytesIO()
+                # Convert to RGB if it's not, to avoid issues with saving as JPEG
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                
+                img.save(output, format='JPEG', quality=self.config.get("image_quality", 85))
+                optimized_data = output.getvalue()
+                
+                original_size = len(image_data)
+                optimized_size = len(optimized_data)
+                reduction = (original_size - optimized_size) / original_size * 100
+                
+                if reduction > 0:
+                    logger.debug(f"Optimized image, reduced size by {reduction:.2f}%")
+                
+                return optimized_data
+        except Exception as e:
+            logger.warning(f"Image optimization failed: {e}. Returning original image.")
+            return image_data
+
     def _minify_css(self, css_data: bytes) -> bytes:
-        """Minify CSS"""
-        try:
-            css_text = css_data.decode('utf-8')
-            
-            # Remove comments
-            css_text = re.sub(r'/\*.*?\*/', '', css_text, flags=re.DOTALL)
-            
-            # Remove unnecessary whitespace
-            css_text = re.sub(r'\s+', ' ', css_text)
-            css_text = re.sub(r';\s*}', '}', css_text)
-            css_text = re.sub(r'{\s*', '{', css_text)
-            css_text = re.sub(r'}\s*', '}', css_text)
-            
-            return css_text.strip().encode('utf-8')
-            
-        except Exception as e:
-            logger.warning(f"Failed to minify CSS: {e}")
+        """
+        Minifies CSS data.
+        """
+        if not self.config.get("minify_css", False):
             return css_data
-    
-    def _minify_js(self, js_data: bytes) -> bytes:
-        """Minify JavaScript"""
+            
         try:
-            js_text = js_data.decode('utf-8')
-            
-            # Remove comments
-            js_text = re.sub(r'//.*$', '', js_text, flags=re.MULTILINE)
-            js_text = re.sub(r'/\*.*?\*/', '', js_text, flags=re.DOTALL)
-            
-            # Remove unnecessary whitespace
-            js_text = re.sub(r'\s+', ' ', js_text)
-            
-            return js_text.strip().encode('utf-8')
-            
+            # Using a library is more robust than regex
+            import rcssmin
+            css_text = css_data.decode('utf-8')
+            minified_text = rcssmin.cssmin(css_text)
+            return minified_text.encode('utf-8')
+        except ImportError:
+            logger.warning("rcssmin not installed. Skipping CSS minification.")
+            return css_data
         except Exception as e:
-            logger.warning(f"Failed to minify JavaScript: {e}")
+            logger.warning(f"CSS minification failed: {e}. Returning original CSS.")
+            return css_data
+
+    def _minify_js(self, js_data: bytes) -> bytes:
+        """
+        Minifies JS data.
+        """
+        if not self.config.get("minify_js", False):
             return js_data
-    
+            
+        try:
+            # Using a library is more robust than regex
+            import rjsmin
+            js_text = js_data.decode('utf-8')
+            minified_text = rjsmin.jsmin(js_text)
+            return minified_text.encode('utf-8')
+        except ImportError:
+            logger.warning("rjsmin not installed. Skipping JS minification.")
+            return js_data
+        except Exception as e:
+            logger.warning(f"JS minification failed: {e}. Returning original JS.")
+            return js_data
+
     def _generate_local_path(self, url: str) -> str:
         """
-        Generates a local path for a URL, preserving its original hostname and path structure
-        to maintain dependencies. All assets will be stored under the 'assets/'
-        directory.
-        e.g., https://static.tildacdn.one/css/tilda.css -> assets/static.tildacdn.one/css/tilda.css
+        Generates a consistent, safe local path for a given asset URL.
+        Example: https://example.com/fonts/my-font.woff?v=1.2 -> assets/fonts/my-font.woff
         """
         if not url:
             return ""
 
-        # Handle schemaless URLs like //static.tildacdn.com/...
-        if url.startswith('//'):
-            url = 'https:' + url
-            
-        try:
-            parsed_url = urlparse(url)
-            
-            # We need a hostname, otherwise we can't create a sane folder structure
-            if not parsed_url.hostname:
-                # If no hostname, maybe it's a relative path.
-                # In our case, this shouldn't happen as extractor makes URLs absolute.
-                # Fallback to a hash-based name in a generic folder.
-                logger.warning(f"URL '{url}' has no hostname. Falling back to hash.")
-                url_hash = hashlib.md5(url.encode()).hexdigest()
-                return os.path.join("assets", "no_hostname", url_hash)
+        # Remove query strings and fragments for path generation
+        parsed_url = urlparse(url)
+        clean_url = parsed_url._replace(query="", fragment="").geturl()
 
-            # Path without the leading slash
-            path_without_slash = parsed_url.path.lstrip('/')
-            
-            # If the path is empty (e.g., https://example.com), use a default name.
-            if not path_without_slash:
-                path_without_slash = "index.html"
-            
-            # If the path ends with a slash, it's a directory; append a default name.
-            elif path_without_slash.endswith('/'):
-                path_without_slash += "index.html"
-                
-            new_path = os.path.join("assets", parsed_url.hostname, path_without_slash)
-            
-            # Normalize the path to handle '..' or '.'
-            new_path = os.path.normpath(new_path)
-            
-            # Final security check: ensure the path starts with 'assets' and does not contain '..'
-            # This prevents path traversal attacks.
-            if not new_path.startswith('assets' + os.sep) or '..' in new_path.split(os.sep):
-                raise ValueError(f"Path traversal attempt detected or invalid path generated: '{new_path}'")
-
-            logger.debug(f"Generated local path '{new_path}' from URL '{url}'")
-            return new_path
-
-        except Exception as e:
-            logger.error(f"Could not parse URL '{url}' to generate local path: {e}. Falling back to hash.")
-            url_hash = hashlib.md5(url.encode()).hexdigest()
-            return os.path.join("assets", "fallback", url_hash)
-    
-    def process_forms(self, forms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Processes form data."""
-        logger.info("📝 Processing forms...")
+        # Create a predictable path based on the URL structure
+        if clean_url.startswith(str(self.config.base_url)):
+            relative_path = Path(clean_url[len(str(self.config.base_url)):]).lstrip('/')
+        else:
+            # For external URLs, place them in an 'external' folder
+            # to avoid conflicts, using the domain as a subfolder.
+            domain = parsed_url.netloc
+            path_part = Path(parsed_url.path).lstrip('/')
+            relative_path = Path('external') / domain / path_part
         
+        # Use a hash of the full original URL for uniqueness if paths are not descriptive
+        # This helps with very long URLs or potential collisions.
+        # Here, we just use the path.
+        
+        final_path = Path(self.config.get("assets_dir", "assets")) / relative_path
+        
+        # Security: prevent path traversal attacks (e.g., ../../)
+        # We ensure the final path is inside the intended assets directory.
+        assets_root = Path(self.config.output_dir) / self.config.get("assets_dir", "assets")
+        
+        # This is a basic check. A more robust implementation would resolve
+        # the absolute paths and check if the asset path starts with the root path.
+        if ".." in str(relative_path):
+             # Fallback to a safe, hashed filename if traversal is detected
+            hashed_name = hashlib.md5(clean_url.encode()).hexdigest()
+            ext = Path(clean_url).suffix
+            final_path = Path(self.config.get("assets_dir", "assets")) / f"{hashed_name}{ext}"
+
+        return str(final_path)
+
+
+    def process_forms(self, forms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Process all forms"""
         processed_forms = []
         for form in forms:
             processed_form = self._process_form(form)
             processed_forms.append(processed_form)
-        
-        logger.info(f"✅ Processed {len(processed_forms)} forms")
         return processed_forms
-    
+
     def _process_form(self, form: Dict[str, Any]) -> Dict[str, Any]:
         """Process individual form"""
-        # Add form handler endpoint
-        form['handler_endpoint'] = '/api/form-handler'
-        
-        # Process fields
-        fields = form.get('fields', [])
-        processed_fields = []
-        
-        for field in fields:
-            processed_field = self._process_form_field(field)
-            processed_fields.append(processed_field)
-        
-        return {
+        processed_form = {
             **form,
-            'fields': processed_fields,
             'processed': True
         }
-    
+        # Additional form processing logic here
+        for i, field in enumerate(form.get('fields', [])):
+            processed_form['fields'][i] = self._process_form_field(field)
+            
+        return processed_form
+
     def _process_form_field(self, field: Dict[str, Any]) -> Dict[str, Any]:
-        """Process form field"""
-        field_type = field.get('type', 'text')
-        
-        # Add validation rules
-        validation = {}
-        
-        if field.get('required'):
-            validation['required'] = True
-        
-        if field_type == 'email':
-            validation['email'] = True
-        
-        if field_type == 'tel':
-            validation['phone'] = True
-        
-        return {
+        """Process individual form field"""
+        processed_field = {
             **field,
-            'validation': validation
+            'processed': True
         }
-    
+        # Additional form field processing logic here
+        
+        return processed_field
+
+    # Method to get the mapping of original URLs to local paths
     def get_asset_mapping(self) -> Dict[str, str]:
-        """Get asset URL mapping"""
-        return self.asset_mapping.copy()
+        return self.asset_mapping
 
+    # Method to get the list of processed assets
     def get_processed_assets(self) -> List[Dict[str, Any]]:
-        """
-        Returns a list of all found assets with their original URL,
-        new local path, and type. The content is downloaded here.
-        This completely bypasses any asset processing/optimization steps.
-        """
-        assets_to_deploy = []
-        session = requests.Session()
-        logger.info(f"Downloading {len(self.asset_mapping)} assets...")
+        return list(self.processed_assets.values())
 
-        for original_url, asset_data in self.asset_mapping.items():
-            try:
-                response = session.get(original_url, timeout=20)
-                response.raise_for_status()
-                
-                assets_to_deploy.append({
-                    "original_url": original_url,
-                    "local_path": asset_data["local_path"],
-                    "type": asset_data["type"],
-                    "content": response.content,
-                })
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Could not download asset {original_url}: {e}")
+    def relativize_links(self, html_content: str, base_url: str) -> str:
+        """
+        Заменяет абсолютные ссылки на относительные в HTML-документе.
+        
+        Args:
+            html_content (str): Исходный HTML.
+            base_url (str): Базовый URL сайта, чьи ссылки нужно заменить.
 
-        logger.info(f"✅ Successfully downloaded {len(assets_to_deploy)} assets.")
-        return assets_to_deploy 
+        Returns:
+            str: Модифицированный HTML с относительными ссылками.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        base_domain = urlparse(base_url).netloc
+
+        tags = {
+            'a': 'href',
+            'link': 'href',
+            'script': 'src',
+            'img': 'src',
+            'source': 'src'
+        }
+
+        for tag, attr in tags.items():
+            for item in soup.find_all(tag, **{attr: True}):
+                url = item[attr]
+                url_parsed = urlparse(url)
+
+                # Заменяем только ссылки, которые ведут на тот же домен
+                if url_parsed.netloc == base_domain:
+                    # Собираем относительный путь
+                    relative_path = f".{url_parsed.path}"
+                    item[attr] = relative_path
+                    logger.debug(f"Relativized link: {url} -> {relative_path}")
+
+        return str(soup)
+
+    def remove_tilda_elements(self, html_content: str) -> str:
+        """
+        Удаляет Tilda-специфичные скрипты, ссылки и комментарии из HTML.
+        
+        Args:
+            html_content (str): Исходный HTML.
+
+        Returns:
+            str: Очищенный HTML.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+
+        # Удаляем скрипты, содержащие "tilda" в src
+        for script in soup.find_all('script', src=True):
+            if 'tilda' in script['src']:
+                src = script['src']
+                script.decompose()
+                logger.debug(f"Removed Tilda script: {src}")
+
+        # Удаляем комментарии, связанные с Tilda
+        from bs4 import Comment
+        for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+            if 'tilda' in comment.lower():
+                comment.extract()
+                logger.debug("Removed Tilda-related comment.")
+        
+        return str(soup) 

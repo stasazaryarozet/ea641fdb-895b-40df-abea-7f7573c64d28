@@ -5,7 +5,7 @@ tilda:
   api_key: "your_tilda_api_key"
   secret_key: "your_tilda_secret_key"
   project_id: "your_tilda_project_id"
-  base_url: "https://your-site.tilda.ws"
+  base_url: "http://parisinseptember.ru"
 
 # Google Cloud Configuration
 google_cloud:
@@ -33,11 +33,14 @@ google_cloud:
 
 # Form Handling Configuration
 forms:
-  form_handler_url: "https://your-form-handler-endpoint.com/submit"
-  email_service: "sendgrid"
-  sendgrid_api_key: "demo_sendgrid_key"
-  smtp:
-    host: "smtp.gmail.com"
+  # This section is for the new Google Sheet form handler.
+  # The 'enabled' flag controls whether the Cloud Function is deployed.
+  google_sheets_handler:
+    enabled: true
+    spreadsheet_id: "your_google_sheet_id" # The long ID from the Sheet's URL
+    sheet_name: "Submissions" # The name of the tab within the sheet
+    function_name: "tilda-form-handler"
+    region: "us-central1" # The region to deploy the function
   
   # Form endpoints
   endpoints:

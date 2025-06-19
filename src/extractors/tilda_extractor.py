@@ -4,84 +4,151 @@ Tilda data extractor
 
 import requests
 from typing import List, Dict, Any
-from bs4 import BeautifulSoup
-import re
-import time
-import base64
-import json
-from pathlib import Path
+from dotmap import DotMap
+from loguru import logger
 
 class TildaExtractor:
-    """Экстрактор для прямого скачивания опубликованного сайта Tilda без API."""
-    def __init__(self, config):
+    """
+    Извлекает данные проекта с Tilda с использованием официального Tilda API.
+    """
+    
+    BASE_API_URL = "http://api.tildacdn.info/v1"
+
+    def __init__(self, config: DotMap):
+        """
+        Инициализирует экстрактор с конфигурацией Tilda.
+
+        Args:
+            config (DotMap): Секция 'tilda' из файла конфигурации.
+                             Должна содержать api_key, secret_key и project_id.
+        """
         self.config = config
-        self.base_url = getattr(config, 'base_url', '').rstrip('/')
-        self.output_path = Path(getattr(config, 'output_dir', 'extracted_data'))
-        self.output_path.mkdir(exist_ok=True)
-        self.session = requests.Session()
-        # Настройка User-Agent для обхода защиты
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        })
+        self.api_key = self.config.api_key
+        self.secret_key = self.config.secret_key
+        self.project_id = self.config.project_id
+        
+        if not all([self.api_key, self.secret_key, self.project_id]):
+            raise ValueError("Tilda API key, secret key, and project ID must be provided.")
+            
+        logger.info("Tilda Extractor (API) initialized.")
 
-    def test_connection(self):
+    def _make_request(self, command: str, params: Dict = None) -> Dict[str, Any]:
+        """
+        Выполняет запрос к Tilda API.
+
+        Args:
+            command (str): Команда API (например, 'getpageslist').
+            params (Dict, optional): Дополнительные параметры запроса. Defaults to None.
+
+        Returns:
+            Dict[str, Any]: Ответ API в формате JSON.
+        """
+        if params is None:
+            params = {}
+        
+        url = f"{self.BASE_API_URL}/{command}/?key={self.api_key}&secret={self.secret_key}"
+        
+        for key, value in params.items():
+            url += f"&{key}={value}"
+        
         try:
-            # Первый запрос для получения cookies от DDoS Guard
-            response = self.session.get(self.base_url, timeout=30)
-            if response.status_code == 200:
-                return True
-            else:
-                raise Exception(f"Site not available: {self.base_url} (Status: {response.status_code})")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Site not available: {self.base_url} - {str(e)}")
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            if data['status'] != 'FOUND':
+                logger.error(f"Tilda API error for command '{command}': {data.get('message', 'Unknown error')}")
+                return None
+            return data['result']
+        except requests.RequestException as e:
+            logger.error(f"Failed to request Tilda API command '{command}'. Error: {e}")
+            return None
 
-    def extract_pages(self) -> List[Dict[str, Any]]:
-        # Скачиваем главную страницу и ищем все внутренние ссылки
+    def get_pages_list(self) -> List[Dict[str, Any]]:
+        """
+        Получает список страниц для указанного project_id.
+        API: http://help-ru.tilda.ws/api/getpageslist
+        """
+        logger.info(f"Requesting pages list for project ID: {self.project_id}...")
+        result = self._make_request("getpageslist", {"projectid": self.project_id})
+        if result and 'pages' in result:
+            logger.success(f"Successfully retrieved {len(result['pages'])} pages.")
+            return result['pages']
+        logger.warning("Could not retrieve pages list or project has no pages.")
+        return []
+
+    def get_page_full_export(self, page_id: str) -> Dict[str, Any]:
+        """
+        Получает полный экспорт страницы, включая HTML, CSS, JS и изображения.
+        API: http://help-ru.tilda.ws/api/getpagefullexport
+        """
+        logger.info(f"Requesting full export for page ID: {page_id}...")
+        result = self._make_request("getpagefullexport", {"pageid": page_id})
+        if result:
+            logger.success(f"Successfully retrieved full export for page ID: {page_id}.")
+        return result
+
+    def get_project_export(self) -> Dict[str, Any]:
+        """
+        Получает полный экспорт проекта.
+        API: http://help-ru.tilda.ws/api/getprojectexport
+        """
+        logger.info(f"Requesting full export for project ID: {self.project_id}...")
+        result = self._make_request("getprojectexport", {"projectid": self.project_id})
+        if result:
+            logger.success(f"Successfully retrieved full export for project ID: {self.project_id}.")
+        return result
+
+    def extract_pages(self) -> list:
+        logger.info(f"Starting page extraction from base URL: {self.base_url}")
         visited = set()
         to_visit = [self.base_url]
         pages = []
         
-        while to_visit:
-            url = to_visit.pop()
-            if url in visited:
-                continue
-            try:
-                # Добавляем задержку между запросами
-                time.sleep(1)
-                resp = self.session.get(url, timeout=30)
-                if resp.status_code != 200:
+        try:
+            while to_visit:
+                url = to_visit.pop(0) # Use as a queue
+                if url in visited:
                     continue
-                html = resp.text
-                pages.append({'url': url, 'html': html})
-                visited.add(url)
-                
-                # Парсим ссылки только с главной страницы для начала
-                if url == self.base_url:
+                    
+                logger.debug(f"Extracting: {url}")
+                try:
+                    self.driver.get(url)
+                    # Wait for the body tag to be present, indicating page has loaded
+                    WebDriverWait(self.driver, 15).until(
+                        EC.presence_of_element_located((By.TAG_NAME, "body"))
+                    )
+                    
+                    html = self.driver.page_source
+                    pages.append({'url': url, 'html': html})
+                    visited.add(url)
+                    
                     soup = BeautifulSoup(html, 'html.parser')
                     for a in soup.find_all('a', href=True):
                         href = a['href']
-                        if href.startswith('/'):
-                            abs_url = self.base_url + href
-                        elif href.startswith(self.base_url):
-                            abs_url = href
-                        else:
+                    
+                        if href.startswith('mailto:') or href.startswith('tel:') or href.startswith('#'):
                             continue
-                        if abs_url not in visited and abs_url not in to_visit:
+
+                        abs_url = urljoin(self.base_url, href)
+                        
+                        # Only follow links that are part of the same base domain
+                        if abs_url.startswith(self.base_url) and abs_url not in visited and abs_url not in to_visit:
+                            logger.debug(f"Found new internal link: {abs_url}")
                             to_visit.append(abs_url)
-                            
-            except Exception as e:
-                print(f"Error extracting page {url}: {e}")
-                continue
+                                
+                except Exception as e:
+                    logger.error(f"Could not extract page {url}. Error: {str(e)}")
+                    continue
+        finally:
+            if self.driver:
+                self.driver.quit()
         
-        # Save pages to a file
+        logger.info(f"Extraction complete. Found {len(pages)} pages.")
+        
         pages_file = self.output_path / "pages.json"
         with open(pages_file, 'w', encoding='utf-8') as f:
             json.dump(pages, f, indent=4, ensure_ascii=False)
+            logger.info(f"✅ Raw page data saved to '{pages_file}'")
 
         return pages
 
@@ -91,35 +158,11 @@ class TildaExtractor:
         # The new flow identifies assets in the processor and downloads them there.
         return []
 
-    def extract_forms(self) -> List[Dict[str, Any]]:
-        # Находим формы на всех страницах
-        pages_data = self.load_extracted_pages()
-        if not pages_data:
-             # If pages.json doesn't exist, we need to extract them first.
-            pages_data = self.extract_pages()
-
-        forms = []
-        for page in pages_data:
-            soup = BeautifulSoup(page['html'], 'html.parser')
-            for form in soup.find_all('form'):
-                action = form.get('action', '')
-                method = form.get('method', 'get').lower()
-                fields = []
-                for input_ in form.find_all('input'):
-                    if input_.get('name'):
-                        fields.append({
-                            'name': input_.get('name'),
-                            'type': input_.get('type', 'text'),
-                            'required': input_.has_attr('required')
-                        })
-                forms.append({'page': page['url'], 'action': action, 'method': method, 'fields': fields})
-        
-        # Save forms to a file
-        forms_file = self.output_path / "forms.json"
-        with open(forms_file, 'w', encoding='utf-8') as f:
-            json.dump(forms, f, indent=4, ensure_ascii=False)
-            
-        return forms
+    def extract_forms(self) -> list:
+        # This can be implemented similarly if needed, by parsing the saved HTML files.
+        # For now, we assume the ContentProcessor handles form discovery.
+        logger.info("Skipping form extraction in TildaExtractor; handled by ContentProcessor.")
+        return []
 
     def _make_absolute(self, url: str) -> str:
         if url.startswith('http://') or url.startswith('https://'):
