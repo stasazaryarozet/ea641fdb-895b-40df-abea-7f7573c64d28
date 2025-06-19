@@ -8,12 +8,16 @@ from bs4 import BeautifulSoup
 import re
 import time
 import base64
+import json
+from pathlib import Path
 
 class TildaExtractor:
     """Экстрактор для прямого скачивания опубликованного сайта Tilda без API."""
     def __init__(self, config):
         self.config = config
         self.base_url = getattr(config, 'base_url', '').rstrip('/')
+        self.output_path = Path(getattr(config, 'output_dir', 'extracted_data'))
+        self.output_path.mkdir(exist_ok=True)
         self.session = requests.Session()
         # Настройка User-Agent для обхода защиты
         self.session.headers.update({
@@ -73,53 +77,29 @@ class TildaExtractor:
             except Exception as e:
                 print(f"Error extracting page {url}: {e}")
                 continue
+        
+        # Save pages to a file
+        pages_file = self.output_path / "pages.json"
+        with open(pages_file, 'w', encoding='utf-8') as f:
+            json.dump(pages, f, indent=4, ensure_ascii=False)
+
         return pages
 
     def extract_assets(self) -> List[Dict[str, Any]]:
-        # Скачиваем все ресурсы (css, js, img) со всех страниц
-        pages = self.extract_pages()
-        asset_urls = set()
-        assets = []
-        
-        for page in pages:
-            soup = BeautifulSoup(page['html'], 'html.parser')
-            # CSS
-            for link in soup.find_all('link', href=True):
-                href = link['href']
-                if href.endswith('.css') or 'css' in href:
-                    asset_urls.add(self._make_absolute(href))
-            # JS
-            for script in soup.find_all('script', src=True):
-                src = script['src']
-                if src.endswith('.js') or 'js' in src:
-                    asset_urls.add(self._make_absolute(src))
-            # IMG
-            for img in soup.find_all('img', src=True):
-                src = img['src']
-                asset_urls.add(self._make_absolute(src))
-                
-        for url in asset_urls:
-            try:
-                time.sleep(0.5)  # Задержка между запросами ресурсов
-                resp = self.session.get(url, timeout=30)
-                if resp.status_code == 200:
-                    # Конвертируем bytes в base64 для JSON сериализации
-                    content_b64 = base64.b64encode(resp.content).decode('utf-8')
-                    assets.append({
-                        'url': url, 
-                        'content': content_b64,
-                        'content_type': resp.headers.get('content-type', 'application/octet-stream')
-                    })
-            except Exception as e:
-                print(f"Error downloading asset {url}: {e}")
-                continue
-        return assets
+        # This method is not used by the new processing flow,
+        # but kept for potential future use or debugging.
+        # The new flow identifies assets in the processor and downloads them there.
+        return []
 
     def extract_forms(self) -> List[Dict[str, Any]]:
         # Находим формы на всех страницах
-        pages = self.extract_pages()
+        pages_data = self.load_extracted_pages()
+        if not pages_data:
+             # If pages.json doesn't exist, we need to extract them first.
+            pages_data = self.extract_pages()
+
         forms = []
-        for page in pages:
+        for page in pages_data:
             soup = BeautifulSoup(page['html'], 'html.parser')
             for form in soup.find_all('form'):
                 action = form.get('action', '')
@@ -133,6 +113,12 @@ class TildaExtractor:
                             'required': input_.has_attr('required')
                         })
                 forms.append({'page': page['url'], 'action': action, 'method': method, 'fields': fields})
+        
+        # Save forms to a file
+        forms_file = self.output_path / "forms.json"
+        with open(forms_file, 'w', encoding='utf-8') as f:
+            json.dump(forms, f, indent=4, ensure_ascii=False)
+            
         return forms
 
     def _make_absolute(self, url: str) -> str:
@@ -143,6 +129,22 @@ class TildaExtractor:
         if url.startswith('/'):
             return self.base_url + url
         return self.base_url + '/' + url
+
+    def load_extracted_pages(self) -> List[Dict[str, Any]]:
+        """Loads pages from the pages.json file."""
+        pages_file = self.output_path / "pages.json"
+        if not pages_file.exists():
+            return []
+        with open(pages_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def load_extracted_forms(self) -> List[Dict[str, Any]]:
+        """Loads forms from the forms.json file."""
+        forms_file = self.output_path / "forms.json"
+        if not forms_file.exists():
+            return []
+        with open(forms_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
 
     def _get_file_extension(self, url: str, content_type: str = None) -> str:
         if url.endswith('.jpg') or (content_type and 'jpeg' in content_type):

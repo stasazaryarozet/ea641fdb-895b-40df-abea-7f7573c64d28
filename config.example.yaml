@@ -33,13 +33,11 @@ google_cloud:
 
 # Form Handling Configuration
 forms:
-  email_service: "sendgrid"  # or "smtp"
-  sendgrid_api_key: "your_sendgrid_api_key"
+  form_handler_url: "https://your-form-handler-endpoint.com/submit"
+  email_service: "sendgrid"
+  sendgrid_api_key: "demo_sendgrid_key"
   smtp:
     host: "smtp.gmail.com"
-    port: 587
-    username: "your_email@gmail.com"
-    password: "your_app_password"
   
   # Form endpoints
   endpoints:
