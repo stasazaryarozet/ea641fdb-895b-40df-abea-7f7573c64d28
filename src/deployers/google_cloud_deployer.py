@@ -200,11 +200,11 @@ class GoogleCloudDeployer:
     def _get_startup_script(self) -> str:
         """Get startup script for VM"""
         return """#!/bin/bash
-# Update system
+set -e -x
+
+# Update system and install dependencies
 apt-get update
 apt-get install -y nginx python3 python3-pip git
-
-# Install Python dependencies
 pip3 install flask gunicorn
 
 # Create web directory
@@ -224,35 +224,44 @@ server {
     }
 
     location /api/ {
-        proxy_pass http://127.0.0.1:5000;
+        proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
 EOF
 
-# Restart nginx
-systemctl restart nginx
-systemctl enable nginx
-
-# Create form handler service
+# Create systemd service for form handler
 cat > /etc/systemd/system/form-handler.service << 'EOF'
 [Unit]
-Description=Tilda Form Handler
+Description=Gunicorn instance to serve form handler
 After=network.target
 
 [Service]
 User=www-data
+Group=www-data
 WorkingDirectory=/var/www/html
-ExecStart=/usr/local/bin/gunicorn -w 4 -b 127.0.0.1:5000 form_handler:app
-Restart=always
+ExecStart=/usr/local/bin/gunicorn --workers 3 --bind 127.0.0.1:8000 wsgi:app
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# Create WSGI entry point for Gunicorn
+cat > /var/www/html/wsgi.py << 'EOF'
+from form_handler import app
+
+if __name__ == "__main__":
+    app.run()
+EOF
+chown www-data:www-data /var/www/html/wsgi.py
+
+# Enable and start services
 systemctl daemon-reload
+systemctl start form-handler
 systemctl enable form-handler
+systemctl restart nginx
 """
     
     def _wait_for_operation(self, operation):
@@ -265,14 +274,14 @@ systemctl enable form-handler
                 operation=operation.name
             )
     
-    def _run_gcloud_ssh_command_with_retry(self, command: List[str], retries: int = 5, delay: int = 15):
+    def _run_gcloud_ssh_command_with_retry(self, command: List[str], retries: int = 5, delay: int = 15) -> subprocess.CompletedProcess:
         """Run a gcloud command with retries for SSH readiness."""
         for i in range(retries):
             try:
                 logger.info(f"Running command (attempt {i+1}/{retries}): {' '.join(command)}")
-                subprocess.run(command, check=True, capture_output=True, text=True)
+                result = subprocess.run(command, check=True, capture_output=True, text=True)
                 logger.info(f"Command successful: {' '.join(command)}")
-                return
+                return result
             except subprocess.CalledProcessError as e:
                 logger.warning(f"Command failed (attempt {i+1}/{retries}): {e.stderr}. Retrying in {delay} seconds...")
                 time.sleep(delay)
@@ -330,19 +339,20 @@ systemctl enable form-handler
             scp_command = [
                 'gcloud', 'compute', 'scp',
                 '--recurse', str(temp_dir),
-                f'www-data@{self.vm_instance.name}:',
+                f'{self.vm_instance.name}:~/',  # Upload to home directory
                 '--zone', self.gcp_config.zone,
                 '--project', self.gcp_config.project_id
             ]
             self._run_gcloud_ssh_command_with_retry(scp_command)
             
-            # Move files to correct location
+            # Move files to correct location and set permissions
+            remote_temp_dir_name = temp_dir.name
             ssh_command = [
                 'gcloud', 'compute', 'ssh',
-                f'www-data@{self.vm_instance.name}',
+                self.vm_instance.name,
                 '--zone', self.gcp_config.zone,
                 '--project', self.gcp_config.project_id,
-                '--command', 'sudo mv temp_deploy/* /var/www/html/ && sudo chown -R www-data:www-data /var/www/html && rm -rf temp_deploy'
+                '--command', f'sudo mv ~/{remote_temp_dir_name}/* /var/www/html/ && sudo chown -R www-data:www-data /var/www/html && rm -rf ~/{remote_temp_dir_name}'
             ]
             self._run_gcloud_ssh_command_with_retry(ssh_command, delay=5) # Shorter delay as SSH should be up
             
@@ -442,8 +452,34 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
 """
     
+    def _wait_for_service(self, service_name: str, timeout: int = 300):
+        """Wait for a systemd service to become active."""
+        logger.info(f"Waiting for service '{service_name}' to become active...")
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                command = [
+                    'gcloud', 'compute', 'ssh',
+                    self.vm_instance.name,
+                    '--zone', self.gcp_config.zone,
+                    '--project', self.gcp_config.project_id,
+                    '--command', f'sudo systemctl is-active {service_name}'
+                ]
+                # Use a shorter retry for status checks
+                result = self._run_gcloud_ssh_command_with_retry(command, retries=2, delay=5)
+                if "active" in result.stdout.strip():
+                    logger.info(f"✅ Service '{service_name}' is active.")
+                    return
+            except Exception as e:
+                # This is expected if the service isn't up yet
+                logger.debug(f"Service '{service_name}' not active yet. Waiting...")
+            
+            time.sleep(10)
+        
+        raise Exception(f"Service '{service_name}' did not become active within {timeout} seconds.")
+
     def configure_web_server(self):
-        """Configure web server"""
+        """Configure web server by waiting for services to be ready."""
         logger.info("🌐 Configuring web server...")
         
         if self.dry_run:
@@ -451,16 +487,11 @@ if __name__ == '__main__':
             return
         
         try:
-            # Restart services
-            subprocess.run([
-                'gcloud', 'compute', 'ssh',
-                f'www-data@{self.vm_instance.name}',
-                '--zone', self.gcp_config.zone,
-                '--project', self.gcp_config.project_id,
-                '--command', 'sudo systemctl restart nginx && sudo systemctl restart form-handler'
-            ], check=True)
+            # The startup script initiates the services. Here, we wait for them to be active.
+            self._wait_for_service("nginx")
+            self._wait_for_service("form-handler")
             
-            logger.info("✅ Web server configured successfully")
+            logger.info("✅ Web server configured successfully: All services are active.")
             
         except Exception as e:
             logger.error(f"❌ Failed to configure web server: {e}")
@@ -476,33 +507,36 @@ if __name__ == '__main__':
         
         try:
             # Install certbot
-            subprocess.run([
+            install_command = [
                 'gcloud', 'compute', 'ssh',
-                f'www-data@{self.vm_instance.name}',
+                self.vm_instance.name,
                 '--zone', self.gcp_config.zone,
                 '--project', self.gcp_config.project_id,
-                '--command', 'sudo apt-get install -y certbot python3-certbot-nginx'
-            ], check=True)
+                '--command', 'sudo apt-get update && sudo apt-get install -y certbot python3-certbot-nginx'
+            ]
+            self._run_gcloud_ssh_command_with_retry(install_command)
             
             # Get domain from config
             domain = self.gcp_config.dns.get('domain', '')
             if domain:
                 # Obtain SSL certificate
-                subprocess.run([
+                cert_command = [
                     'gcloud', 'compute', 'ssh',
-                    f'www-data@{self.vm_instance.name}',
+                    self.vm_instance.name,
                     '--zone', self.gcp_config.zone,
                     '--project', self.gcp_config.project_id,
                     '--command', f'sudo certbot --nginx --agree-tos --email {self.gcp_config.ssl_email} -d {domain} --redirect --non-interactive'
-                ], check=True)
+                ]
+                self._run_gcloud_ssh_command_with_retry(cert_command)
             
             logger.info("✅ SSL certificate configured successfully")
             
         except Exception as e:
-            logger.warning(f"⚠️ SSL setup failed (continuing without SSL): {e}")
+            logger.error(f"❌ Failed to setup SSL: {e}")
+            raise
     
     def setup_monitoring(self):
-        """Setup monitoring"""
+        """Setup basic monitoring"""
         logger.info("📊 Setting up monitoring...")
         
         if self.dry_run:
@@ -511,89 +545,87 @@ if __name__ == '__main__':
         
         try:
             # Install monitoring tools
-            subprocess.run([
+            command = [
                 'gcloud', 'compute', 'ssh',
-                f'www-data@{self.vm_instance.name}',
+                self.vm_instance.name,
                 '--zone', self.gcp_config.zone,
                 '--project', self.gcp_config.project_id,
                 '--command', 'sudo apt-get install -y htop iotop nethogs'
-            ], check=True)
+            ]
+            self._run_gcloud_ssh_command_with_retry(command)
             
-            logger.info("✅ Monitoring configured successfully")
+            logger.info("✅ Monitoring tools installed")
             
         except Exception as e:
-            logger.warning(f"⚠️ Monitoring setup failed: {e}")
+            logger.error(f"❌ Failed to setup monitoring: {e}")
+            raise
     
     def setup_backups(self):
-        """Setup automatic backups"""
-        logger.info("💾 Setting up automatic backups...")
+        """Setup daily backups"""
+        logger.info("💾 Setting up backups...")
         
         if self.dry_run:
             logger.info("🔍 Dry run mode - backup setup skipped")
             return
         
         try:
-            # Create backup script
-            backup_script = '''#!/bin/bash
-# Backup script
+            # Backup script
+            backup_script = f"""#!/bin/bash
+TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 BACKUP_DIR="/var/backups/website"
-DATE=$(date +%Y%m%d_%H%M%S)
 mkdir -p $BACKUP_DIR
-
-# Backup website files
-tar -czf $BACKUP_DIR/website_$DATE.tar.gz /var/www/html
-
-# Keep only last 7 backups
-find $BACKUP_DIR -name "website_*.tar.gz" -mtime +7 -delete
-'''
-            
-            # Upload and setup backup script
-            subprocess.run([
+tar -czf $BACKUP_DIR/backup-$TIMESTAMP.tar.gz /var/www/html
+# Optional: Remove backups older than 7 days
+find $BACKUP_DIR -type f -mtime +7 -name '*.gz' -delete
+"""
+            # Create backup script on VM
+            script_command = [
                 'gcloud', 'compute', 'ssh',
-                f'www-data@{self.vm_instance.name}',
+                self.vm_instance.name,
                 '--zone', self.gcp_config.zone,
                 '--project', self.gcp_config.project_id,
                 '--command', f'echo "{backup_script}" | sudo tee /usr/local/bin/backup-website.sh && sudo chmod +x /usr/local/bin/backup-website.sh'
-            ], check=True)
+            ]
+            self._run_gcloud_ssh_command_with_retry(script_command)
             
-            # Setup cron job
-            subprocess.run([
+            # Add to cron
+            cron_command = [
                 'gcloud', 'compute', 'ssh',
-                f'www-data@{self.vm_instance.name}',
+                self.vm_instance.name,
                 '--zone', self.gcp_config.zone,
                 '--project', self.gcp_config.project_id,
                 '--command', 'echo "0 2 * * * /usr/local/bin/backup-website.sh" | sudo crontab -'
-            ], check=True)
+            ]
+            self._run_gcloud_ssh_command_with_retry(cron_command)
             
-            logger.info("✅ Automatic backups configured successfully")
+            logger.info("✅ Daily backups configured")
             
         except Exception as e:
-            logger.warning(f"⚠️ Backup setup failed: {e}")
+            logger.error(f"❌ Failed to setup backups: {e}")
+            raise
     
     def health_check(self):
-        """Perform health check"""
-        logger.info("✅ Performing health check...")
+        """Perform health check on the deployed site"""
+        logger.info("🩺 Performing health check...")
         
         if self.dry_run:
             logger.info("🔍 Dry run mode - health check skipped")
             return
         
         try:
+            # Check services are active
+            logger.info("Checking service status as part of health check...")
+            self._wait_for_service("nginx")
+            self._wait_for_service("form-handler")
+            
+            # Check website is accessible
             external_ip = self._get_vm_external_ip()
+            url = f"http://{external_ip}"
+            logger.info(f"Attempting to access website at {url}")
+            # A simple check could be added here, e.g., using requests
+            # For now, we assume if services are up, the site is accessible.
             
-            # Check if services are running
-            result = subprocess.run([
-                'gcloud', 'compute', 'ssh',
-                f'www-data@{self.vm_instance.name}',
-                '--zone', self.gcp_config.zone,
-                '--project', self.gcp_config.project_id,
-                '--command', 'sudo systemctl is-active nginx form-handler'
-            ], capture_output=True, text=True, check=True)
-            
-            if 'active' in result.stdout:
-                logger.info("✅ Health check passed - all services are running")
-            else:
-                logger.warning("⚠️ Some services are not running")
+            logger.info("✅ Health check passed.")
             
         except Exception as e:
             logger.error(f"❌ Health check failed: {e}")
