@@ -1,0 +1,70 @@
+# Tilda to Google Cloud Migration Agent Configuration
+
+# Tilda Configuration
+tilda:
+  api_key: "your_tilda_api_key"
+  secret_key: "your_tilda_secret_key"
+  project_id: "your_tilda_project_id"
+  base_url: "https://your-site.tilda.ws"
+
+# Google Cloud Configuration
+google_cloud:
+  project_id: "your-gcp-project-id"
+  region: "us-central1"
+  zone: "us-central1-a"
+  credentials_file: "path/to/service-account-key.json"
+  
+  # VM Configuration
+  vm:
+    name: "tilda-migrated-site"
+    machine_type: "e2-micro"
+    disk_size_gb: 20
+    image_family: "debian-11"
+    image_project: "debian-cloud"
+    
+  # Storage Configuration
+  storage:
+    bucket_name: "tilda-migrated-assets"
+    
+  # DNS Configuration
+  dns:
+    zone_name: "your-domain-zone"
+    domain: "your-domain.com"
+
+# Form Handling Configuration
+forms:
+  email_service: "sendgrid"  # or "smtp"
+  sendgrid_api_key: "your_sendgrid_api_key"
+  smtp:
+    host: "smtp.gmail.com"
+    port: 587
+    username: "your_email@gmail.com"
+    password: "your_app_password"
+  
+  # Form endpoints
+  endpoints:
+    contact: "/api/contact"
+    newsletter: "/api/newsletter"
+    callback: "/api/callback"
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  file: "logs/migration.log"
+  max_size: "10 MB"
+  rotation: "1 day"
+  
+# Processing Configuration
+processing:
+  download_images: true
+  optimize_images: true
+  minify_css: true
+  minify_js: true
+  preserve_original_structure: true
+  
+# Deployment Configuration
+deployment:
+  web_server: "nginx"
+  ssl_certificate: "letsencrypt"
+  auto_backup: true
+  monitoring: true 
