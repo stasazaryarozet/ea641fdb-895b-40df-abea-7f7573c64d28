@@ -274,14 +274,17 @@ systemctl restart nginx
                 operation=operation.name
             )
     
-    def _run_gcloud_ssh_command_with_retry(self, command: List[str], retries: int = 5, delay: int = 15) -> subprocess.CompletedProcess:
+    def _run_gcloud_ssh_command_with_retry(self, command: List[str], retries: int = 5, delay: int = 15, timeout: int = 300) -> subprocess.CompletedProcess:
         """Run a gcloud command with retries for SSH readiness."""
         for i in range(retries):
             try:
                 logger.info(f"Running command (attempt {i+1}/{retries}): {' '.join(command)}")
-                result = subprocess.run(command, check=True, capture_output=True, text=True)
+                result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
                 logger.info(f"Command successful: {' '.join(command)}")
                 return result
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Command timed out (attempt {i+1}/{retries}). Retrying in {delay} seconds...")
+                time.sleep(delay)
             except subprocess.CalledProcessError as e:
                 logger.warning(f"Command failed (attempt {i+1}/{retries}): {e.stderr}. Retrying in {delay} seconds...")
                 time.sleep(delay)
